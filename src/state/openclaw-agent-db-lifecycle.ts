@@ -96,6 +96,14 @@ const cache = resolveGlobalSingleton<AgentDatabaseLifecycle>(
   }),
 );
 
+/** Runtime reads and opens share the generation-aware process-local damage latch. */
+export function assertAgentDatabaseTerminalOpenAllowed(pathname: string): void {
+  const failure = cache.terminal.get(pathname);
+  if (failure) {
+    throw failure;
+  }
+}
+
 function logResourceCloseFailure(pathname: string, error: unknown): void {
   agentDbLog.warn("Agent database resource close failed", { path: pathname, error });
 }
@@ -240,7 +248,10 @@ export function closeCachedOpenClawAgentDatabase(
   // Eviction must stay cheap: PASSIVE skips waiting on concurrent readers,
   // whose drained TRUNCATE checkpoints blocked the event loop for seconds.
   const lease = cache.leases.get(database.path);
+  const alreadyClosed = !database.db.isOpen;
+  const priorCheckpointError = database.walMaintenance.health?.state === "error";
   let clean: { path: string; identity: string } | undefined;
+  let retainRuntimeProof: boolean;
   try {
     disposeNodeSqliteDependents(database.db);
     const checkpointed = database.walMaintenance.close(
@@ -256,6 +267,13 @@ export function closeCachedOpenClawAgentDatabase(
         clean = { path: database.path, identity };
       }
     }
+    // A reader-pinned WAL is healthy; only restart proof needs a completed checkpoint.
+    retainRuntimeProof =
+      !cache.failures.has(database.path) &&
+      (alreadyClosed
+        ? !priorCheckpointError
+        : database.walMaintenance.health?.state === "blocked" &&
+          isOpenClawAgentDatabasePathCurrent(database));
     if (database.db.isOpen) {
       database.db.close();
     }
@@ -266,7 +284,11 @@ export function closeCachedOpenClawAgentDatabase(
     throw error;
   }
   if (lease) {
-    releaseOpenClawAgentDatabaseLease(lease.leaseId, { env: lease.env }, clean);
+    releaseOpenClawAgentDatabaseLease(
+      lease.leaseId,
+      { env: lease.env },
+      clean ?? (retainRuntimeProof ? "uncheckpointed" : undefined),
+    );
     cache.leases.delete(database.path);
   }
   releaseAgentDeletionDatabaseCleanup(database);
